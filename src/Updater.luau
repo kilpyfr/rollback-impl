@@ -53,6 +53,7 @@ local JumpStartCFrame: CFrame | any
 local RemoteJumpCFrame: CFrame | any
 local DefaultY: number
 
+local GameConnection: RBXScriptConnection
 
 local function faceOther()
 	local OtherPosition1 = Vector3.new(RemoteHrp.Position.X, LocalHrp.Position.Y, RemoteHrp.Position.Z)
@@ -292,7 +293,13 @@ end
 
 function Updater.StartLoop(startFrame: number)
 	currentFrame = 0
-	RunService.Heartbeat:Connect(loopFunction)
+	GameConnection = RunService.Heartbeat:Connect(loopFunction)
+end
+
+function Updater.StopLoop()
+	if GameConnection then
+	GameConnection:Disconnect()
+	end
 end
 
 function Updater.GetLocalFrame() : number
@@ -335,3 +342,4 @@ function Updater.DecipherPacket(Info: Types.NetworkPacket)
 end
 
 return Updater
+
