@@ -1,3 +1,4 @@
+--!strict
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -314,6 +315,9 @@ function Updater.AddPlayerInfo(CurrentPlayerModel:Model, OtherPlayerModel: Model
 	
 	AnimUtil.TranslateToAnimation("", LocalAnimator, Vector3.new())
 	AnimUtil.TranslateToAnimation("", RemoteAnimator, Vector3.new())
+	
+
+	DebugManager.AddUI(CurrentPlayer.PlayerGui.Debug)
 end
 
 function Updater.DecipherPacket(Info: Types.NetworkPacket)
