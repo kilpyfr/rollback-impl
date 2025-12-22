@@ -253,8 +253,6 @@ local function loopFunction(delta: number)
 		
 			local result = Movement.Walk(RemoteHrp.CFrame, remoteAction)
 			RemoteHrp.CFrame = result
-			
-		elseif remoteAction == "" and not remoteJumping then
 
 		elseif remoteJumping then
 			
