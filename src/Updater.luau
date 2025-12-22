@@ -208,12 +208,11 @@ local function loopFunction(delta: number)
 				jumpInput = InputCheck
 				InputQueue.AddInput(currentAction, currentFrame, 1)
 			end
-			local animator = LocalAnimator
-			AnimUtil.TerminateAllAnims(animator)
+			AnimUtil.TerminateAllAnims(LocalAnimator)
 			if not jumping then
-				AnimUtil.TranslateToAnimation(InputCheck, animator, LocalHrp.CFrame.LookVector)
+				AnimUtil.TranslateToAnimation(InputCheck, LocalAnimator, LocalHrp.CFrame.LookVector)
 			else
-				AnimUtil.TranslateToAnimation("Jump", animator, Vector3.new())
+				AnimUtil.TranslateToAnimation("Jump", LocalAnimator, Vector3.new())
 			end
 			currentAction = InputCheck
 			
