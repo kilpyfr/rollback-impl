@@ -22,7 +22,7 @@ local Peer: Player
 local DefaultContext = InputModule.NewContext("Default")
 
 local DWalkAction = InputModule.NewAction(DefaultContext, "DWalk")
-local AWalkAction = InputModule.NewAction(DefaultContext, "WWalk")
+local AWalkAction = InputModule.NewAction(DefaultContext, "AWalk")
 local JumpAction = InputModule.NewAction(DefaultContext, "Jump")
 
 local DWalkBind1 = InputModule.NewBinding(DWalkAction, "DBinding")
