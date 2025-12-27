@@ -61,6 +61,7 @@ local LocalHitbox: BasePart
 local GameConnection: RBXScriptConnection
 
 local function resetRemoteJump()
+	-- reset data for remote jump
 	remoteJumpFrame = 0
 	remoteJumpInput  = ""
 	RemoteJumpCFrame = nil
@@ -73,6 +74,7 @@ end
 
 
 local function updateHitbox()
+	-- update hitbox visualizer
 	LocalHitbox.CFrame = LocalCFrame - Vector3.new(0,0.3,0)
 	RemoteHitbox.CFrame = RemoteCFrame - Vector3.new(0,0.3,0)
 end
@@ -121,9 +123,7 @@ local function initiateRollback()
 		local wasJumping = State.RemoteJumping
 		
 		local jumpstart = false
-		
-		
-		
+
 		if string.find(remoteAction, "Jump") and not wasJumping then
 			remoteJumpInput = remoteAction
 			remoteJumping = true
@@ -165,14 +165,8 @@ local function initiateRollback()
 				GameState.replaceRemotePosition(i, resultantPosition)
 			end
 		end
-		
-		
-		
-			RemoteCFrame = resultantPosition
-		
-		
 
-	
+			RemoteCFrame = resultantPosition
 end
 
 local function getLastInputStates(number: number): {[number]: Types.packet}
@@ -205,7 +199,7 @@ local function loopFunction(delta: number)
 				initiateRollback()
 			end
 		end
-	
+		
 		faceOther()
 		
 		currentFrame += 1
@@ -213,6 +207,7 @@ local function loopFunction(delta: number)
 		local InputCheck = InputQueue.CheckInputs(currentFrame)	 
 	
 		if InputCheck then
+			-- filter out invalid inputs to be used
 			if string.find(InputCheck, "Jump") then	
 				
 				if currentFrame - lastJumpLand >= landFrames and not jumping then
@@ -241,7 +236,6 @@ local function loopFunction(delta: number)
 			
 			
 			local result = Movement.Jump(JumpStartCFrame, jumpInput, jumpFrame)
-		--	print(result, LocalHrp.CFrame)
 
 			LocalCFrame = LocalCFrame.Rotation + result.Position
 			
@@ -277,12 +271,8 @@ local function loopFunction(delta: number)
 			RemoteCFrame = RemoteCFrame.Rotation + result.Position
 		
 			if remoteJumpFrame == jumpLength then
-				RemoteCFrame = RemoteCFrame.Rotation + Vector3.new(RemoteCFrame.X, DefaultY, RemoteCFrame.Z)
-			
+				RemoteCFrame = RemoteCFrame.Rotation + Vector3.new(RemoteCFrame.X, DefaultY, RemoteCFrame.Z)	
 				resetRemoteJump()
-				
-
-				
 			end
 			print("remotejump", remoteJumpFrame, RemoteCFrame)
 		end
@@ -302,7 +292,7 @@ local function loopFunction(delta: number)
 		InputQueue.StoreInput(currentAction, currentFrame)
 		local networkinputs = getLastInputStates(2)
 
-
+		-- send info to remote player
 		Packets.SendInfo.send({
 			input1 = networkinputs[1].input,
 			frame1= networkinputs[1].frame,
@@ -338,6 +328,7 @@ function Updater.GetLocalFrame() : number
 	return currentFrame
 end
 function Updater.AddPlayerInfo(CurrentPlayerModel:Types.Character, OtherPlayerModel: Types.Character, CurrentPlayer: Player, OtherPlayer: Player, CurrentHitbox: BasePart, OtherHitbox: BasePart, Ground: BasePart)
+	--set information
 	LocalPlayer = CurrentPlayer
 	RemotePlayer = OtherPlayer
 
@@ -355,7 +346,7 @@ function Updater.AddPlayerInfo(CurrentPlayerModel:Types.Character, OtherPlayerMo
 end
 
 function Updater.DecipherPacket(Info: Types.NetworkPacket)
-
+	-- decipher info from remote player
 	remoteFrame = Info.frame3
 	if not GameState.getRemoteData(Info.frame1) then
 		GameState.addRemoteData(Info.frame1, Info.input1)
