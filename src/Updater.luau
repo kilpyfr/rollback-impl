@@ -9,15 +9,17 @@ local InputQueue = require(script.Parent.InputQueue)
 local Packets = require(ReplicatedStorage.AllPackets)
 local GameState =require(script.Parent.GameState)
 local AnimUtil = require(script.Parent.AnimationUtil)
+local Renderer = require(script.Renderer)
 local DebugManager = require(script.Parent.DebugManager)
 
 local Updater = {}
 
-local maxRollbackFrames = 8
-
 local currentFrame = 0
 local remoteFrame = 0
 local syncFrame = 0
+
+local currentActionFrame = 0
+local remoteActionFrame = 0
 
 local jumpFrame = 0
 local jumping = false
@@ -27,41 +29,61 @@ local remoteJumpFrame = 0
 local remoteJumping = false
 local remoteJumpInput = ""
 
+local landFrames = 4
+local lastJumpLand = 0
+
+local jumpLength = 31
+
 local fixedDelta = 1/60
 local accumulator = 0
 
 local currentAction = ""
 local remoteAction = ""
 
-local LocalPlayerModel: Types.Character
-local RemotePlayerModel: Types.Character
+local JumpStartCFrame: CFrame | any
+local RemoteJumpCFrame: CFrame | any
+
+local LocalCFrame: CFrame
+local RemoteCFrame: CFrame
+
+local Platform: BasePart
+
+local DefaultY: number
 
 local RemotePlayer: Player
 local LocalPlayer: Player
 
-local RemoteHrp: BasePart
-local LocalHrp: BasePart
-
-local RemoteAnimator: Animator
-local LocalAnimator: Animator
-
-local Platform: BasePart
-
 local lastPacket: Types.NetworkPacket
 
-local JumpStartCFrame: CFrame | any
-local RemoteJumpCFrame: CFrame | any
-local DefaultY: number
+local RemoteHitbox: BasePart
+local LocalHitbox: BasePart
 
 local GameConnection: RBXScriptConnection
 
+local function resetRemoteJump()
+	remoteJumpFrame = 0
+	remoteJumpInput  = ""
+	RemoteJumpCFrame = nil
+	remoteJumping = false
+	
+	if string.find(remoteAction, "Jump") then
+		remoteAction = ""
+	end
+end
+
+
+local function updateHitbox()
+	LocalHitbox.CFrame = LocalCFrame - Vector3.new(0,0.3,0)
+	RemoteHitbox.CFrame = RemoteCFrame - Vector3.new(0,0.3,0)
+end
+
 local function faceOther()
-	local OtherPosition1 = Vector3.new(RemoteHrp.Position.X, LocalHrp.Position.Y, RemoteHrp.Position.Z)
+	local OtherPosition1 = Vector3.new(RemoteCFrame.Position.X, LocalCFrame.Position.Y, RemoteCFrame.Position.Z)
 	
-	LocalHrp.CFrame = CFrame.lookAt(LocalHrp.Position, OtherPosition1)
+	LocalCFrame = CFrame.lookAt(LocalCFrame.Position, OtherPosition1)
 	
-	local OtherPosition2 = Vector3.new(LocalHrp.Position.X, RemoteHrp.Position.Y, LocalHrp.Position.Z)
-	RemoteHrp.CFrame = CFrame.lookAt(RemoteHrp.Position, OtherPosition2)
+	local OtherPosition2 = Vector3.new(LocalCFrame.Position.X, RemoteCFrame.Position.Y, LocalCFrame.Position.Z)
+	RemoteCFrame = CFrame.lookAt(RemoteCFrame.Position, OtherPosition2)
 end
 local function updateSyncFrame()
 	local finalFrame = remoteFrame
@@ -88,63 +110,67 @@ end
 local function initiateRollback()
 	DebugManager.UpdateRollbackFrames(currentFrame - syncFrame)
 		local State = GameState.read(syncFrame)
-
+		
+		local lastAction = remoteAction
 		remoteAction = GameState.getRemoteData(syncFrame + 1).RemoteInput
 		
+		if lastAction ~= remoteAction then
+			remoteActionFrame = remoteFrame - (syncFrame + 1)
+		end
+		
+		local wasJumping = State.RemoteJumping
+		
 		local jumpstart = false
-		if string.find(remoteAction, "Jump") and not remoteJumping then
+		
+		
+		
+		if string.find(remoteAction, "Jump") and not wasJumping then
 			remoteJumpInput = remoteAction
 			remoteJumping = true
 			remoteJumpFrame = 0
 			jumpstart = true
 		end
 		
-		local resultantPosition = State.RemotePosition
+		local resultantPosition: CFrame = State.RemotePosition
 		
-		AnimUtil.TerminateAllAnims(RemoteAnimator)
+		if jumpstart then
+			RemoteJumpCFrame = resultantPosition
+		end
 		
-		--print("updating")
+		
 		for i = syncFrame +1, currentFrame do
 			
 			GameState.replaceRemoteInput(i, remoteAction)
 			GameState.correctPredictedData(i, remoteAction)
 			
-			if (remoteAction == "D" or remoteAction == "A") and not remoteJumping then
+			if (remoteAction == "D" or remoteAction == "A") and not wasJumping and not remoteJumping then
 				resultantPosition = Movement.Walk(resultantPosition, remoteAction)
 
 			elseif jumpstart then
 			
-				if not RemoteJumpCFrame then
-					RemoteJumpCFrame = resultantPosition
-				end
 				remoteJumpFrame += 1
 
 				local result = Movement.Jump(RemoteJumpCFrame, remoteJumpInput, remoteJumpFrame)
 
-				local collisionResult = Movement.CheckCollision(result.Position, Vector3.new(0,-3,0), Platform, RemotePlayerModel:GetChildren())
-				if collisionResult and remoteJumpFrame > 1 then
+				
+				resultantPosition = result
+				
+				if remoteJumpFrame == jumpLength then		
 					resultantPosition = resultantPosition.Rotation + Vector3.new(resultantPosition.X, DefaultY, resultantPosition.Z)
-					
-					remoteJumpFrame = 0
-					remoteJumpInput  = ""
-					RemoteJumpCFrame = nil
-					remoteJumping = false
-				else
-					resultantPosition = result
+					resetRemoteJump()
 				end
-			end
-			GameState.replaceRemotePosition(i, resultantPosition)
-		end
-		
-		
-		if not remoteJumping then
-			RemoteHrp.CFrame = resultantPosition
-			--print("animsupdate")
-			AnimUtil.TranslateToAnimation(remoteAction, RemoteAnimator, RemoteHrp.CFrame.LookVector)
-		else
 			
-			AnimUtil.TranslateToAnimation("Jump", RemoteAnimator, Vector3.new())
+			end
+			if not wasJumping then
+				GameState.replaceRemotePosition(i, resultantPosition)
+			end
 		end
+		
+		
+		
+			RemoteCFrame = resultantPosition
+		
+		
 
 	
 end
@@ -164,13 +190,12 @@ local function getLastInputStates(number: number): {[number]: Types.packet}
 	return packetArray
 end
 	--[[To Do:
-				Find out why line 108 sometimes prints false and/or errors
-				Figure out the core cause of the desync (may need to jot down some math/logic)
-				Find out why line 93 errors when spamming D or A very fast
+			Fix desync with jumping
+			Decouple gamestate and rendering
 		]]
 local function loopFunction(delta: number)
 	accumulator += delta
-	
+
 	while accumulator > fixedDelta do
 		accumulator -= fixedDelta
 		
@@ -184,104 +209,114 @@ local function loopFunction(delta: number)
 		faceOther()
 		
 		currentFrame += 1
-
+		
 		local InputCheck = InputQueue.CheckInputs(currentFrame)	 
-		InputQueue.StoreInput(currentAction, currentFrame)
-		local networkinputs = getLastInputStates(2)
-		
-		
-			Packets.SendInfo.send({
-				input1 = networkinputs[1].input,
-				frame1= networkinputs[1].frame,
-				input2 = networkinputs[2].input,
-				frame2= networkinputs[2].frame,
-				input3 = networkinputs[3].input,
-				frame3= networkinputs[3].frame,
-				OtherPlayer = RemotePlayer,
-				TimeSent = workspace:GetServerTimeNow(),
-
-			})
-				
+	
 		if InputCheck then
-			if string.find(InputCheck, "Jump") and not jumping then
-				jumping = true
-				jumpInput = InputCheck
-				InputQueue.AddInput(currentAction, currentFrame, 1)
-			end
-			AnimUtil.TerminateAllAnims(LocalAnimator)
-			if not jumping then
-				AnimUtil.TranslateToAnimation(InputCheck, LocalAnimator, LocalHrp.CFrame.LookVector)
+			if string.find(InputCheck, "Jump") then	
+				
+				if currentFrame - lastJumpLand >= landFrames and not jumping then
+						jumping = true
+						jumpInput = InputCheck
+						InputQueue.AddInput(currentAction, currentFrame, 1)
+						currentAction = InputCheck
+						currentActionFrame = 0
+				end
 			else
-				AnimUtil.TranslateToAnimation("Jump", LocalAnimator, Vector3.new())
+				currentAction = InputCheck
+				currentActionFrame = 0
 			end
-			currentAction = InputCheck
-			
+				
 		end			
 		if (currentAction == "D" or currentAction == "A") and not jumping then
-			local result = Movement.Walk(LocalHrp.CFrame, currentAction)
-			LocalHrp.CFrame = result
+			local result = Movement.Walk(LocalCFrame, currentAction)
+			
+			LocalCFrame = result
 		elseif jumping then
 			
 			if not JumpStartCFrame then
-			JumpStartCFrame = LocalHrp.CFrame
+			JumpStartCFrame = LocalCFrame
 			end	
 			jumpFrame += 1
 			
+			
 			local result = Movement.Jump(JumpStartCFrame, jumpInput, jumpFrame)
 		--	print(result, LocalHrp.CFrame)
+
+			LocalCFrame = LocalCFrame.Rotation + result.Position
 			
-			local collisionResult = Movement.CheckCollision(result.Position, Vector3.new(0,-3,0), Platform, LocalPlayerModel:GetChildren())
-			
-			if collisionResult and jumpFrame > 1 then
-		
-				LocalHrp.CFrame = LocalHrp.CFrame.Rotation + Vector3.new(LocalHrp.Position.X, DefaultY, LocalHrp.Position.Z)
+			if jumpFrame == jumpLength then	
+				LocalCFrame = LocalCFrame.Rotation + Vector3.new(LocalCFrame.X, DefaultY, LocalCFrame.Z)
 				
 				jumpFrame = 0
 				jumpInput  = ""
 				JumpStartCFrame = nil
 				jumping = false
+				lastJumpLand = currentFrame
 				
-				AnimUtil.TerminateAllAnims(LocalAnimator)
-				AnimUtil.TranslateToAnimation(currentAction, LocalAnimator, LocalHrp.CFrame.LookVector)
-			else
-				LocalHrp.CFrame = LocalHrp.CFrame.Rotation + result.Position
+				if string.find(currentAction, "Jump") then
+					currentAction = ""
+				end
 			end
+			
+			print("localjump", jumpFrame, LocalCFrame)
 		end
 		
 		if (remoteAction == "D" or remoteAction == "A") and not remoteJumping then
-		
-			local result = Movement.Walk(RemoteHrp.CFrame, remoteAction)
-			RemoteHrp.CFrame = result
+			
+			local result = Movement.Walk(RemoteCFrame, remoteAction)
+			RemoteCFrame = result
 
 		elseif remoteJumping then
 			
 			remoteJumpFrame += 1
 
 			local result = Movement.Jump(RemoteJumpCFrame, remoteJumpInput, remoteJumpFrame)
+
+
+			RemoteCFrame = RemoteCFrame.Rotation + result.Position
+		
+			if remoteJumpFrame == jumpLength then
+				RemoteCFrame = RemoteCFrame.Rotation + Vector3.new(RemoteCFrame.X, DefaultY, RemoteCFrame.Z)
 			
-			local collisionResult = Movement.CheckCollision(result.Position, Vector3.new(0,-3,0), Platform, RemotePlayerModel:GetChildren())
-
-			if collisionResult and remoteJumpFrame > 1 then
-
-				RemoteHrp.CFrame = RemoteHrp.CFrame.Rotation + Vector3.new(RemoteHrp.Position.X, DefaultY, RemoteHrp.Position.Z)
+				resetRemoteJump()
 				
-				remoteJumpFrame = 0
-				remoteJumpInput  = ""
-				RemoteJumpCFrame = nil
-				remoteJumping = false
+
 				
-				AnimUtil.TerminateAllAnims(RemoteAnimator)
-				AnimUtil.TranslateToAnimation(remoteAction, RemoteAnimator, RemoteHrp.CFrame.LookVector)
-			else
-				RemoteHrp.CFrame = RemoteHrp.CFrame.Rotation + result.Position
 			end
+			print("remotejump", remoteJumpFrame, RemoteCFrame)
 		end
+		
+		currentActionFrame += 1
+		remoteActionFrame += 1
+		
 		GameState.addPredictedData(currentFrame, remoteAction)
 		
-		GameState.add(currentAction, remoteAction, LocalHrp.CFrame, RemoteHrp.CFrame, currentFrame, remoteFrame)
-		--ReadPacket(lastPacket)
+		GameState.add(currentAction, remoteAction, LocalCFrame, RemoteCFrame, currentFrame, remoteFrame, jumping, remoteJumping)
+	
 		DebugManager.UpdateFrames(currentFrame, remoteFrame)
+		
+		updateHitbox()
+		
+		
+		InputQueue.StoreInput(currentAction, currentFrame)
+		local networkinputs = getLastInputStates(2)
+
+
+		Packets.SendInfo.send({
+			input1 = networkinputs[1].input,
+			frame1= networkinputs[1].frame,
+			input2 = networkinputs[2].input,
+			frame2= networkinputs[2].frame,
+			input3 = networkinputs[3].input,
+			frame3= networkinputs[3].frame,
+			OtherPlayer = RemotePlayer,
+			TimeSent = workspace:GetServerTimeNow(),
+
+		})
+
 	end
+	Renderer.RenderFrame(currentAction, remoteAction, LocalCFrame, RemoteCFrame, jumping, remoteJumping, currentActionFrame, remoteActionFrame)
 end
 
 function Updater.Stop()
@@ -302,26 +337,21 @@ end
 function Updater.GetLocalFrame() : number
 	return currentFrame
 end
-function Updater.AddPlayerInfo(CurrentPlayerModel:Model, OtherPlayerModel: Model, CurrentPlayer: Player, OtherPlayer: Player, Ground: BasePart)
-	LocalPlayerModel = CurrentPlayerModel :: Types.Character
-	RemotePlayerModel = OtherPlayerModel :: Types.Character
+function Updater.AddPlayerInfo(CurrentPlayerModel:Types.Character, OtherPlayerModel: Types.Character, CurrentPlayer: Player, OtherPlayer: Player, CurrentHitbox: BasePart, OtherHitbox: BasePart, Ground: BasePart)
 	LocalPlayer = CurrentPlayer
 	RemotePlayer = OtherPlayer
-	LocalHrp = LocalPlayerModel.HumanoidRootPart
-	RemoteHrp = RemotePlayerModel.HumanoidRootPart 
-	LocalAnimator = LocalPlayerModel.Humanoid.Animator
-	RemoteAnimator = RemotePlayerModel.Humanoid.Animator
-	DefaultY = LocalHrp.Position.Y
+
+	DefaultY = CurrentPlayerModel.HumanoidRootPart.CFrame.Y
 	Platform = Ground
+	LocalHitbox = CurrentHitbox
+	RemoteHitbox = OtherHitbox
 	
-	AnimUtil.LoadAnimations(LocalAnimator)
-	AnimUtil.LoadAnimations(RemoteAnimator)
-	
-	AnimUtil.TranslateToAnimation("", LocalAnimator, Vector3.new())
-	AnimUtil.TranslateToAnimation("", RemoteAnimator, Vector3.new())
-	
+	LocalCFrame = CurrentPlayerModel.HumanoidRootPart.CFrame
+	RemoteCFrame = OtherPlayerModel.HumanoidRootPart.CFrame
 
 	DebugManager.AddUI(CurrentPlayer.PlayerGui.Debug)
+	
+	Renderer.AddRenderInstances(CurrentPlayerModel, OtherPlayerModel)
 end
 
 function Updater.DecipherPacket(Info: Types.NetworkPacket)
@@ -339,4 +369,3 @@ function Updater.DecipherPacket(Info: Types.NetworkPacket)
 end
 
 return Updater
-
