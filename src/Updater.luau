@@ -1,10 +1,17 @@
 --!strict
 
 --[[
-    Updater - Fixed timestep netcode for rollback fighting game stuff
+    Updater - Fixed timestep rollback netcode
     
-    The gist: both clients run the same simulation. We predict the opponent's 
-    moves locally, then rewind and replay when their actual inputs arrive.
+    Fighting games need sub-frame response times. Roblox's default replication 
+    has ~100ms latency, which feels terrible for precise platforming/combat.
+    
+    Instead, we run the full simulation locally and predict what the opponent 
+    will do. When their actual inputs arrive, we rewind to where we diverged 
+    and replay with the correct data. This is how GGPO and modern fighters work.
+    
+    Tradeoff: requires deterministic physics (same inputs = same results) and
+    burns CPU to resimulate. But latency feels instant.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -22,15 +29,22 @@ local DebugManager = require(script.Parent.DebugManager)
 local Updater = {}
 
 -- Frame counters
+-- currentFrame: our simulation head, always advances
+-- remoteFrame: last confirmed frame from opponent (stale until packet arrives)
+-- syncFrame: last frame where our prediction matched reality
 local currentFrame = 0
 local remoteFrame = 0
 local syncFrame = 0
 
--- Animation timing (frames since action started)
+-- Animation timing tracks "how long since action started" rather than 
+-- absolute frames. This lets us blend animations smoothly even during rollback.
 local currentActionFrame = 0
 local remoteActionFrame = 0
 
--- Jump state
+-- Jump state machines
+-- Local jump: predicted immediately for responsive feel
+-- Remote jump: simulated here but driven by delayed network inputs
+-- Both use identical physics curves to keep determinism
 local jumpFrame = 0
 local jumping = false
 local jumpInput = ""
@@ -39,69 +53,91 @@ local remoteJumpFrame = 0
 local remoteJumping = false
 local remoteJumpInput = ""
 
--- Jump config
-local landFrames = 4  -- coyote time buffer
-local lastJumpLand = 0
-local jumpLength = 31  -- how long a jump takes
+-- Jump tuning
+local landFrames = 4      -- coyote time: can jump this many frames after leaving ground
+local lastJumpLand = 0    -- frame we last landed, for spam prevention
+local jumpLength = 31     -- fixed animation curve length in frames
 
--- Fixed timestep stuff
+-- Fixed timestep accumulator
+-- Heartbeat fires irregularly (60-240hz depending on client). We accumulate
+-- delta time and step simulation in discrete 1/60s chunks. This ensures:
+-- 1. Identical physics across all clients regardless of render FPS
+-- 2. Reproducible replays (same inputs = same positions)
+-- 3. Stable rollback (we can re-simulate frame N identically)
 local fixedDelta = 1/60
 local accumulator = 0
 
--- Actions ("A", "D", "JumpL", etc)
+-- Action strings ("A", "D", "JumpL") instead of enums
+-- Tradeoff: typo-vulnerable but human-readable in network dumps and debugger
 local currentAction = ""
 local remoteAction = ""
 
--- CFrames for jump calculations
+-- Jump physics needs start CFrame for consistent arcs
+-- We store full CFrame (not just Position) because facing direction matters
 local JumpStartCFrame: CFrame
 local RemoteJumpCFrame: CFrame
 
+-- Current simulation positions
 local LocalCFrame: CFrame
 local RemoteCFrame: CFrame
 
+-- Ground reference for landing height reset
+-- Assumes flat ground; curved terrain would need raycast instead
 local Platform: BasePart
-local DefaultY: number  -- ground height for landing
+local DefaultY: number
 
+-- Player references for network targeting and camera ownership
 local RemotePlayer: Player
 local LocalPlayer: Player
 
+-- Last packet for detecting network stalls (not fully implemented yet)
 local lastPacket: Types.NetworkPacket
 
+-- Visual hitbox debuggers
+-- Using parts instead of UI so we can see world-space alignment
 local RemoteHitbox: BasePart
 local LocalHitbox: BasePart
 
 local GameConnection: RBXScriptConnection
 
+-- Reset remote jump state. Separated because rollback may need to reset
+-- mid-simulation without affecting local state.
 local function resetRemoteJump()
 	remoteJumpFrame = 0
 	remoteJumpInput = ""
 	RemoteJumpCFrame = nil
 	remoteJumping = false
 	
+	-- Strip Jump prefix but preserve directional modifiers if any
 	if string.find(remoteAction, "Jump") then
 		remoteAction = ""
 	end
 end
 
+-- Update visual hitbox positions. These lag one simulation frame behind
+-- but that's fine for debugging - they're just visualization.
 local function updateHitbox()
-	-- visual hitboxes lag one frame behind but that's fine for debugging
 	LocalHitbox.CFrame = LocalCFrame - Vector3.new(0, 0.3, 0)
 	RemoteHitbox.CFrame = RemoteCFrame - Vector3.new(0, 0.3, 0)
 end
 
+-- Lock characters to face each other on X/Z plane, ignoring Y (jump height).
+-- This guarantees attacks connect horizontally even during vertical spacing.
+-- Separate calculations because local and remote Y positions differ.
 local function faceOther()
-	-- lock Y so we don't tilt up/down when someone jumps
 	local target1 = Vector3.new(RemoteCFrame.Position.X, LocalCFrame.Position.Y, RemoteCFrame.Position.Z)
 	LocalCFrame = CFrame.lookAt(LocalCFrame.Position, target1)
 	
-	local target2 = Vector3.new(LocalCFrame.Position.X, RemoteCFrame.Position.Y, LocalCFrame.Position.Z)
+	local target2 = Vector3.new(LocalCFrame.Position.X, RemoteCFrame.Position.Y, RemoteCFrame.Position.Z)
 	RemoteCFrame = CFrame.lookAt(RemoteCFrame.Position, target2)
 end
 
---[[
-    Find the last frame where we agreed with the server/opponent.
-    If we guessed wrong about their inputs, we rewind to here.
-]]
+-- Find the oldest frame where our prediction diverged from reality.
+-- We scan forward from last known good (syncFrame) because inputs arrive
+-- out of order and we may have already corrected some frames.
+--
+-- Optimization: stop at min(currentFrame, remoteFrame) because we can't
+-- validate frames we haven't simulated or haven't received yet.
 local function updateSyncFrame()
 	local finalFrame = math.min(remoteFrame, currentFrame)
 	local foundFrame: number?
@@ -116,13 +152,14 @@ local function updateSyncFrame()
 	syncFrame = foundFrame and (foundFrame - 1) or finalFrame
 end
 
---[[
-    The rollback. necessary for responsive netcode.
-    
-    We load state from syncFrame, then re-simulate everything up to now
-    using the correct remote inputs. If Movement.Jump isn't deterministic,
-    this whole thing falls apart.
-]]
+-- Rollback and resimulation. This is the core of the netcode.
+--
+-- When syncFrame < currentFrame, we diverged from the server/opponent.
+-- We load state from syncFrame, then re-simulate everything up to now
+-- using the correct remote inputs.
+--
+-- Critical: Movement.Jump must return identical results given identical
+-- inputs and start CFrames, or desync compounds with each rollback.
 local function initiateRollback()
 	DebugManager.UpdateRollbackFrames(currentFrame - syncFrame)
 	
@@ -130,6 +167,7 @@ local function initiateRollback()
 	local lastAction = remoteAction
 	remoteAction = GameState.getRemoteData(syncFrame + 1).RemoteInput
 	
+	-- Action change detection: reset actionFrame for animation blending
 	if lastAction ~= remoteAction then
 		remoteActionFrame = remoteFrame - (syncFrame + 1)
 	end
@@ -137,7 +175,7 @@ local function initiateRollback()
 	local wasJumping = State.RemoteJumping
 	local jumpstart = false
 
-	-- did they start jumping between syncFrame and now?
+	-- Detect if opponent started jumping between syncFrame and now
 	if string.find(remoteAction, "Jump") and not wasJumping then
 		remoteJumpInput = remoteAction
 		remoteJumping = true
@@ -151,6 +189,7 @@ local function initiateRollback()
 		RemoteJumpCFrame = resultantPosition
 	end
 	
+	-- Resimulation loop: deterministic replay with corrected inputs
 	for i = syncFrame + 1, currentFrame do
 		GameState.replaceRemoteInput(i, remoteAction)
 		GameState.correctPredictedData(i, remoteAction)
@@ -176,11 +215,10 @@ local function initiateRollback()
 	RemoteCFrame = resultantPosition
 end
 
---[[
-    We send last 3 inputs because UDP drops packets sometimes.
-    Redundancy means the remote can reconstruct our input stream
-    even if one packet gets lost.
-]]
+-- Package last N inputs for network transmission.
+-- We send 3 because UDP drops packets. Redundancy lets the remote reconstruct
+-- our input stream even if one packet is lost. Frame numbers allow idempotent
+-- application (they can ignore duplicates).
 local function getLastInputStates(count: number): {[number]: Types.packet}
 	local packetArray = {}
 	for i = count, 0, -1 do
@@ -193,10 +231,11 @@ end
 local function loopFunction(delta: number)
 	accumulator += delta
 
+	-- Consume accumulated time in fixed chunks
 	while accumulator > fixedDelta do
 		accumulator -= fixedDelta
 		
-		-- check if we need to rollback
+		-- Phase 1: Reconcile with remote if we have data
 		if lastPacket and currentFrame >= 1 then	
 			updateSyncFrame()
 			if currentFrame > syncFrame and remoteFrame > syncFrame then
@@ -207,12 +246,12 @@ local function loopFunction(delta: number)
 		faceOther()
 		currentFrame += 1
 		
-		-- grab local input
+		-- Phase 2: Sample and validate local input
 		local InputCheck = InputQueue.CheckInputs(currentFrame)	 
 
 		if InputCheck then
+			-- Jump validation: check coyote time and grounded state
 			if string.find(InputCheck, "Jump") then	
-				-- only jump if we're grounded and not spamming
 				if currentFrame - lastJumpLand >= landFrames and not jumping then
 					jumping = true
 					jumpInput = InputCheck
@@ -221,12 +260,13 @@ local function loopFunction(delta: number)
 					currentActionFrame = 0
 				end
 			else
+				-- Directional inputs: immediate transition, no validation needed
 				currentAction = InputCheck
 				currentActionFrame = 0
 			end
 		end			
 		
-		-- local physics
+		-- Phase 3: Local physics simulation
 		if (currentAction == "D" or currentAction == "A") and not jumping then
 			LocalCFrame = Movement.Walk(LocalCFrame, currentAction)
 		elseif jumping then
@@ -236,6 +276,7 @@ local function loopFunction(delta: number)
 			jumpFrame += 1
 			
 			local result = Movement.Jump(JumpStartCFrame, jumpInput, jumpFrame)
+			-- Preserve rotation, adopt new position from jump curve
 			LocalCFrame = LocalCFrame.Rotation + result.Position
 			
 			if jumpFrame == jumpLength then	
@@ -252,7 +293,7 @@ local function loopFunction(delta: number)
 			end
 		end
 		
-		-- remote physics (predicted or corrected)
+		-- Phase 4: Remote physics simulation (predicted or corrected)
 		if (remoteAction == "D" or remoteAction == "A") and not remoteJumping then
 			RemoteCFrame = Movement.Walk(RemoteCFrame, remoteAction)
 		elseif remoteJumping then
@@ -269,14 +310,14 @@ local function loopFunction(delta: number)
 		currentActionFrame += 1
 		remoteActionFrame += 1
 		
-		-- save state so we can rollback later
+		-- Phase 5: Record state for future rollbacks
 		GameState.addPredictedData(currentFrame, remoteAction)
 		GameState.add(currentAction, remoteAction, LocalCFrame, RemoteCFrame, currentFrame, remoteFrame, jumping, remoteJumping)
 	
 		DebugManager.UpdateFrames(currentFrame, remoteFrame)
 		updateHitbox()
 		
-		-- send inputs to other player
+		-- Phase 6: Network transmission
 		InputQueue.StoreInput(currentAction, currentFrame)
 		local networkinputs = getLastInputStates(2)
 
@@ -292,10 +333,11 @@ local function loopFunction(delta: number)
 		})
 	end
 	
-	-- render happens every visual frame, not every sim step
+	-- Render interpolation happens every visual frame, not every simulation step
 	Renderer.RenderFrame(currentAction, remoteAction, LocalCFrame, RemoteCFrame, jumping, remoteJumping, currentActionFrame, remoteActionFrame)
 end
 
+-- Graceful shutdown: send empty input to signal disconnection
 function Updater.Stop()
 	InputQueue.AddInput("", currentFrame, 1)
 end
@@ -315,6 +357,7 @@ function Updater.GetLocalFrame(): number
 	return currentFrame
 end
 
+-- Dependency injection to avoid circular requires (GameState needs Updater)
 function Updater.AddPlayerInfo(
 	CurrentPlayerModel: Types.Character, 
 	OtherPlayerModel: Types.Character, 
@@ -339,13 +382,12 @@ function Updater.AddPlayerInfo(
 	Renderer.AddRenderInstances(CurrentPlayerModel, OtherPlayerModel)
 end
 
---[[
-    Packets can arrive out of order. We use frame numbers to slot
-    inputs into the right place and ignore duplicates.
-]]
+-- Process incoming packet. UDP doesn't guarantee order, so we use frame 
+-- numbers to slot inputs into the right place and ignore duplicates.
 function Updater.DecipherPacket(Info: Types.NetworkPacket)
 	remoteFrame = Info.frame3
 	
+	-- Backfill missing frames if packet arrived out of order
 	if not GameState.getRemoteData(Info.frame1) then
 		GameState.addRemoteData(Info.frame1, Info.input1)
 	end
